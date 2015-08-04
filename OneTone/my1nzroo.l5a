@@ -1,0 +1,639 @@
+﻿using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Net;
+using System.Windows;
+using System.Windows.Data;
+using System.Windows.Controls;
+using System.Windows.Media;
+using System.Windows.Navigation;
+using Microsoft.Phone.Controls;
+using Microsoft.Phone.Shell;
+using Microsoft.Phone.Tasks;
+using Microsoft.Live;
+using System.Collections.ObjectModel;
+using OneTone.BusinessObjects;
+using System.Threading.Tasks;
+using System.IO;
+using System.IO.IsolatedStorage;
+using Microsoft.Phone.BackgroundAudio;
+using System.Threading;
+using System.Windows.Threading;
+
+namespace OneTone
+{
+    public partial class BrowsePage : PhoneApplicationPage
+    {
+        //One drive my files list
+        private ObservableCollection<OneDriveObject> myFilesList = new ObservableCollection<OneDriveObject>();
+        //One drive shared files list
+        private ObservableCollection<OneDriveObject> sharedFilesList = new ObservableCollection<OneDriveObject>();
+        //The Save ringtone chooser
+        SaveRingtoneTask saveRingtoneChooser;
+        //A reference to the current list item
+        object myCurListItem;
+        //A reference to the current shared list item
+        object sharedCurListItem;
+        //Constants for panorama pages
+        const int MyFiles = 0;
+        const int SharedFiles = 1;
+
+        /// <summary>
+        /// The application bar media button
+        /// </summary>
+        ApplicationBarIconButton appBarMediaButton;
+
+        /// <summary>
+        /// The application bar save button
+        /// </summary>
+        ApplicationBarIconButton appBarSaveButton;
+
+        /// <summary>
+        /// The application bar share button
+        /// </summary>
+        ApplicationBarIconButton appBarShareButton;
+
+        /// <summary>
+        /// The current one drive directory for the user's files
+        /// </summary>
+        private OneDriveObject myCurDirectory = null;
+        /// <summary>
+        /// The current one drive directory for the user's shared files
+        /// </summary>
+        private OneDriveObject sharedCurDirectory = null;
+        /// <summary>
+        /// The current one drive file
+        /// </summary>
+        private OneDriveObject myCurFile = null;
+        /// <summary>
+        /// The current one drive file
+        /// </summary>
+        private OneDriveObject sharedCurFile = null;
+
+        /// <summary>
+        /// Default Constructor
+        /// </summary>
+        public BrowsePage()
+        {
+            InitializeComponent();
+        }
+
+        /// <summary>
+        /// Fetch the root directory of the users OneDrive folder
+        /// </summary>
+        private async Task<ObservableCollection<OneDriveObject>> FetchDirectory(string path)
+        {
+            try
+            {
+                //Exit if the provided path is null
+                if (path == null) return null;
+ 
+                ObservableCollection<OneDriveObject> result;
+
+                //Show progress bar
+                progressLoading.Visibility = System.Windows.Visibility.Visible;
+
+                //Get a list of objects in the path
+                result = await OneDriveObject.GetDirectory(path);                
+
+                //Hide progress bar
+                progressLoading.Visibility = System.Windows.Visibility.Collapsed;
+
+                return result;
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show(ex.Message);
+                return null;
+            }
+        }
+
+        private async void PhoneApplicationPage_Loaded(object sender, RoutedEventArgs e)
+        {
+            //Make sure the user is authenticated. If not go back to the main page
+            if (Session.CurSession == null)
+            {
+                MessageBox.Show("Please sign in to continue.");
+                NavigationService.GoBack();
+            }
+
+            //Prevent the user from going back to the intro page
+            NavigationService.RemoveBackEntry();
+
+            //Get a reference to the App Bar buttons
+            appBarMediaButton = (ApplicationBarIconButton)ApplicationBar.Buttons[0];
+            appBarSaveButton = (ApplicationBarIconButton)ApplicationBar.Buttons[1];
+            appBarShareButton = (ApplicationBarIconButton)ApplicationBar.Buttons[3];
+
+            //Get a list of root elements from the user's One Drive and shared drive
+            myFilesList = await FetchDirectory("me/skydrive/files");
+            lstMyFiles.ItemsSource = myFilesList;
+            sharedFilesList = await FetchDirectory("me/skydrive/shared");
+            lstSharedFiles.ItemsSource = sharedFilesList;
+
+            //Set the Save ringtone display
+            saveRingtoneChooser = new SaveRingtoneTask();
+            saveRingtoneChooser.Completed += saveRingtoneChooser_Completed;
+        }
+
+        /// <summary>
+        /// Page was navigated to 
+        /// </summary>
+        /// <param name="e"></param>
+        protected override void OnNavigatedTo(NavigationEventArgs e)
+        {
+            //Stop playing media
+            StopMedia();
+
+            //Clear any existing selection
+            ClearSelection();
+
+            //Disable buttons
+            DisableButtons();
+        }
+
+        /// <summary>
+        /// The user has completed the save ringtone screen activity
+        /// </summary>
+        /// <param name="sender"></param>
+        /// <param name="e"></param>
+        void saveRingtoneChooser_Completed(object sender, TaskEventArgs e)
+        {
+            if (e.Error != null)
+            {
+                MessageBox.Show(e.Error.Message);
+                return;
+            }
+
+            switch (e.TaskResult)
+            {
+                case TaskResult.Cancel:
+                    //User Cancelled
+                    break;
+                case TaskResult.None:
+                    MessageBox.Show("Ringtone cannot be saved");
+                    break;
+                case TaskResult.OK:
+                    //Ringtone Saved
+                    break;
+            }
+        }
+
+        /// <summary>
+        /// Download the selected file to local storage
+        /// </summary>
+        /// <param name="path"></param>
+        /// <param name="fileName"></param>
+        private async void DownloadFile(string path, string fileName)
+        {
+            try
+            {
+                //Get a reference to the list item
+                OneDriveObject lstItem = new OneDriveObject();
+
+                switch(ringtonePanorama.SelectedIndex)
+                {
+                    case MyFiles:
+                        lstItem = (OneDriveObject)lstMyFiles.SelectedItem;
+                        break;
+                    case SharedFiles:
+                        lstItem = (OneDriveObject)lstSharedFiles.SelectedItem;
+                        break;
+                }
+                
+
+                //Live progress for file download
+                Progress<LiveOperationProgress> downloadProgress = new Progress<LiveOperationProgress>(
+                    (p) =>
+                    {
+                        lstItem.DownloadProgress = p.ProgressPercentage;
+                    });
+
+                //Fetch the file from the user's One Drive account
+                LiveConnectClient downloadClient = new LiveConnectClient(Session.CurSession);
+                LiveDownloadOperationResult downloadResult = await downloadClient.DownloadAsync(
+                        string.Concat(path, "/content"), CancellationToken.None, downloadProgress );
+                
+                //Move the file to the apps local storage
+                Stream fileStream = downloadResult.Stream;
+                using (IsolatedStorageFile storage = IsolatedStorageFile.GetUserStoreForApplication())
+                {
+                    using (IsolatedStorageFileStream fileToSave = storage.OpenFile(fileName, FileMode.Create, FileAccess.ReadWrite))
+                    {
+                        fileStream.CopyTo(fileToSave);
+                        fileStream.Flush();
+                        fileStream.Close();                      
+                    }                   
+
+                    using (Stream isoStream = storage.OpenFile(fileName, FileMode.Open))
+                    {
+                        mediaPlayer.SetSource(isoStream);
+                    }
+                }
+
+                //Clear the download progress
+                lstItem.DownloadProgress = 0;
+
+                //Enable the save and share buttons
+                appBarSaveButton.IsEnabled = true;
+                appBarShareButton.IsEnabled = true;
+
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show(ex.Message);
+            }
+        }
+
+        /// <summary>
+        /// Display the save ringtone screen
+        /// </summary>
+        private void SaveRingtone(string file)
+        {
+            saveRingtoneChooser.Source = new Uri(string.Concat("isostore:/", file));
+
+            saveRingtoneChooser.DisplayName = file.Substring(0, file.LastIndexOf("."));
+
+            saveRingtoneChooser.Show();
+        }
+
+        /// <summary>
+        /// The user selected an item in the OneDrive list
+        /// </summary>
+        /// <param name="sender"></param>
+        /// <param name="e"></param>
+        private async void lstOneDrive_SelectionChanged(object sender, SelectionChangedEventArgs e)
+        {
+            //Exit if the selected item is null
+            if (lstMyFiles.SelectedItem == null) return;
+
+            //If the selected item is the same as the current item, exit
+            if (lstMyFiles.SelectedItem == myCurListItem) return;
+
+           //Clear the shared files list selection
+            ClearSelectionForList(sharedFilesList, lstSharedFiles);
+
+            //Get a referenc to the current list item
+            myCurListItem = lstMyFiles.SelectedItem;
+
+            //Highlight the selected item
+            HighlightSelection((OneDriveObject)myCurListItem, myFilesList);
+
+            //Stop playing the preview
+            mediaPlayer.Stop();
+
+            //Disable the play, save, and share buttons
+            appBarMediaButton.IsEnabled = false;
+            appBarSaveButton.IsEnabled = false;
+            appBarShareButton.IsEnabled = false;
+
+            //Get the one drive object
+            OneDriveObject selectedItem = (OneDriveObject)myCurListItem;
+
+            //Take action based on the type of item selected
+            switch (selectedItem.ObjectType)
+            {
+                case "folder":
+                    //Navigate to the folder
+                    myFilesList = await FetchDirectory(string.Concat(selectedItem.ID, "/files"));
+                    lstMyFiles.ItemsSource = myFilesList;
+                    //Set the current object
+                    myCurDirectory = await OneDriveObject.GetObject(selectedItem.ID);
+                    break;
+                case "audio":
+                    //Set the current object
+                    myCurFile = await OneDriveObject.GetObject(selectedItem.ID);
+                    DownloadFile(selectedItem.ID, selectedItem.Name);
+                    break;
+            }
+        }
+
+        /// <summary>
+        /// The user selected an item in the OneDrive list
+        /// </summary>
+        /// <param name="sender"></param>
+        /// <param name="e"></param>
+        private async void lstSharedDrive_SelectionChanged(object sender, SelectionChangedEventArgs e)
+        {
+            //Exit if the selected item is null
+            if (lstSharedFiles.SelectedItem == null) return;
+
+            //If the selected item is the same as the current item, exit
+            if (lstSharedFiles.SelectedItem == sharedCurListItem) return;
+
+            //Clear the shared files list selection
+            ClearSelectionForList(MyFiles, lstMyFiles);
+
+            //Get a referenc to the current list item
+            sharedCurListItem = lstSharedFiles.SelectedItem;
+
+            //Highlight the selected item
+            HighlightSelection((OneDriveObject)sharedCurListItem, sharedFilesList);
+
+            //Stop playing the preview
+            mediaPlayer.Stop();
+
+            //Disable the play, save, and share buttons
+            appBarMediaButton.IsEnabled = false;
+            appBarSaveButton.IsEnabled = false;
+            appBarShareButton.IsEnabled = false;
+
+            //Get the one drive object
+            OneDriveObject selectedItem = (OneDriveObject)sharedCurListItem;
+
+            //Take action based on the type of item selected
+            switch (selectedItem.ObjectType)
+            {
+                case "folder":
+                    //Navigate to the folder
+                    sharedFilesList = await FetchDirectory(string.Concat(selectedItem.ID, "/files"));
+                    lstSharedFiles.ItemsSource = sharedFilesList;
+                    //Set the current object
+                    sharedCurDirectory = await OneDriveObject.GetObject(selectedItem.ID);
+                    break;
+                case "audio":
+                    //Set the current object
+                    sharedCurFile = await OneDriveObject.GetObject(selectedItem.ID);
+                    DownloadFile(selectedItem.ID, selectedItem.Name);
+                    break;
+            }
+        }
+
+        /// <summary>
+        /// Highlight the selected item in the list
+        /// </summary>
+        /// <param name="selectedItem"></param>
+        /// <param name="itemList"></param>
+        private void HighlightSelection(OneDriveObject selectedItem, ObservableCollection<OneDriveObject> itemList)
+        {
+            //Clear existing selection
+            foreach (OneDriveObject item in itemList)
+            {
+                item.TextColor = new SolidColorBrush(Colors.White);
+            }
+
+            //Highlight selected item
+            selectedItem.TextColor = new SolidColorBrush(Session.AccentColor);
+        }
+
+        /// <summary>
+        /// Handle the back key navigation
+        /// </summary>
+        /// <param name="sender"></param>
+        /// <param name="e"></param>
+        private async void PhoneApplicationPage_BackKeyPress(object sender, System.ComponentModel.CancelEventArgs e)
+        {
+            try
+            {
+                //Stop playing the preview
+                mediaPlayer.Stop();
+                mediaPlayer.Source = null;
+
+                //Disable the play, share, and save buttons
+                appBarMediaButton.IsEnabled = false;
+                appBarSaveButton.IsEnabled = false;
+                appBarShareButton.IsEnabled = false;
+
+                //Clear curfile
+                myCurFile = null;
+                sharedCurFile = null;
+
+                //Determine what list the user is currently viewing
+                switch (ringtonePanorama.SelectedIndex)
+                {
+                    case MyFiles:
+                        if (myCurDirectory != null && myCurDirectory.ParentID != null)
+                        {
+                            //Cancel navigating away from this page
+                            e.Cancel = true;
+
+                            //Load the previous directory
+                            myFilesList = await FetchDirectory(string.Concat(myCurDirectory.ParentID, "/files"));
+                            lstMyFiles.ItemsSource = myFilesList;
+                            //Set the current directory
+                            myCurDirectory = await OneDriveObject.GetObject(myCurDirectory.ParentID);
+                        }
+                        break;
+                    case SharedFiles:
+                        if (sharedCurDirectory != null && sharedCurDirectory.ParentID != null)
+                        {
+                            //Cancel navigating away from this page
+                            e.Cancel = true;
+
+                            //Load the previous directory
+                            sharedFilesList = await FetchDirectory(string.Concat(sharedCurDirectory.ParentID, "/files"));
+                            lstSharedFiles.ItemsSource = sharedFilesList;
+                            //Set the current directory
+                            sharedCurDirectory = await OneDriveObject.GetObject(sharedCurDirectory.ParentID);
+                        }
+                        break;
+                }
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show(ex.Message);
+            }
+        }
+
+        /// <summary>
+        /// Media Player failed event
+        /// </summary>
+        /// <param name="sender"></param>
+        /// <param name="e"></param>
+        private void mediaPlayer_MediaFailed(object sender, ExceptionRoutedEventArgs e)
+        {
+            MessageBox.Show(e.ErrorException.Message);
+        }
+
+        /// <summary>
+        /// A new file was opened in the media player
+        /// </summary>
+        /// <param name="sender"></param>
+        /// <param name="e"></param>
+        private void mediaPlayer_MediaOpened(object sender, RoutedEventArgs e)
+        {
+            //Play the newly opened file
+            mediaPlayer.Play();
+        }
+
+        /// <summary>
+        /// Toggle the play state of the media element
+        /// </summary>
+        /// <param name="sender"></param>
+        /// <param name="e"></param>
+        private void ApplicationBarMedia_Click(object sender, EventArgs e)
+        {
+            if (mediaPlayer.Source == null) return;
+
+            switch (mediaPlayer.CurrentState)
+            {
+                case MediaElementState.Playing:
+                    mediaPlayer.Stop();
+                    break;
+                case MediaElementState.Stopped:
+                    mediaPlayer.Play();
+                    break;
+                case MediaElementState.Paused:
+                    mediaPlayer.Play();
+                    break;
+            }
+        }
+
+        /// <summary>
+        /// Display the save ringtone prompt
+        /// </summary>
+        /// <param name="sender"></param>
+        /// <param name="e"></param>
+        private void ApplicationBarSave_Click(object sender, EventArgs e)
+        {
+            switch (ringtonePanorama.SelectedIndex)
+            {
+                case MyFiles:
+                    //Save the selected ringtone from the myfiles list
+                    if (myCurFile != null)
+                    {
+                        SaveRingtone(myCurFile.Name);
+                    }
+                    break;
+                case SharedFiles:
+                    //Save the selected ringtone from the shared files list
+                    if (sharedCurFile != null)
+                    {
+                        SaveRingtone(sharedCurFile.Name);
+                    }
+                    break;
+            }
+        }
+
+        /// <summary>
+        /// The media player state changed
+        /// </summary>
+        /// <param name="sender"></param>
+        /// <param name="e"></param>
+        private void mediaPlayer_CurrentStateChanged(object sender, RoutedEventArgs e)
+        {
+            switch (mediaPlayer.CurrentState)
+            {
+                case MediaElementState.Opening:
+                    //A file is loading
+                    appBarMediaButton.IsEnabled = true;
+                    break;
+                case MediaElementState.Closed:
+                    //No file is loaded
+                    appBarMediaButton.IsEnabled = false;
+                    break;
+                case MediaElementState.Paused:
+                    //The media player is paused
+                    appBarMediaButton.Text = "Play";
+                    appBarMediaButton.IconUri = new Uri("/Assets/Images/appbar_play.png", UriKind.Relative);
+                    break;
+                case MediaElementState.Playing:
+                    //The media player is playing
+                    appBarMediaButton.Text = "Pause";
+                    appBarMediaButton.IconUri = new Uri("/Assets/Images/appbar_pause.png", UriKind.Relative);
+                    break;
+                case MediaElementState.Stopped:
+                    //The media player is stopped
+                    appBarMediaButton.Text = "Play";
+                    appBarMediaButton.IconUri = new Uri("/Assets/Images/appbar_play.png", UriKind.Relative);
+                    break;
+
+            }
+        }
+
+        /// <summary>
+        /// Share the selected file
+        /// </summary>
+        /// <param name="sender"></param>
+        /// <param name="e"></param>
+        private void ApplicationBarShare_Click(object sender, EventArgs e)
+        {
+            switch (ringtonePanorama.SelectedIndex)
+            {
+                case MyFiles:
+                    Session.SharedFile = myCurFile;
+                    break;
+                case SharedFiles:
+                    Session.SharedFile = sharedCurFile;
+                    break;
+            }
+
+            //Navigate to the share page
+            NavigationService.Navigate(new Uri("/TapAndShare.xaml", UriKind.Relative));
+        }
+
+        /// <summary>
+        /// Disable context sensitive buttons
+        /// </summary>
+        private void DisableButtons()
+        {
+            if (appBarMediaButton != null) appBarMediaButton.IsEnabled = false;
+            if (appBarSaveButton != null) appBarSaveButton.IsEnabled = false;
+            if (appBarShareButton != null) appBarShareButton.IsEnabled = false;                        
+        }
+
+        /// <summary>
+        /// Stop the media player and clear the source
+        /// </summary>
+        private void StopMedia()
+        {
+            if (mediaPlayer.CurrentState != MediaElementState.Stopped)
+            { 
+                mediaPlayer.Stop(); 
+            }
+            
+            mediaPlayer.Source = null;
+        }
+
+        /// <summary>
+        /// Clear any selections in the given list
+        /// </summary>
+        /// <param name="ItemList"></param>
+        private void ClearSelectionForList(ObservableCollection<OneDriveObject> ItemList, LongListSelector ListControl)
+        {
+            //Clear existing selection
+            foreach (OneDriveObject item in ItemList)
+            {
+                item.TextColor = new SolidColorBrush(Colors.White);
+            }
+
+            //Clear the selected item in the list
+            ListControl.SelectedItem = null;
+        }
+
+        /// <summary>
+        /// Clear the selection for both the myfiles and shared files lists
+        /// </summary>
+        private void ClearSelection()
+        {
+            //Clear myFiles list
+            if (lstMyFiles.ItemsSource != null)
+            {
+                foreach (OneDriveObject item in lstMyFiles.ItemsSource)
+                {
+                    item.TextColor = new SolidColorBrush(Colors.White);
+                }
+            }
+
+            //Clear sharedFiles list
+            if (lstSharedFiles.ItemsSource != null)
+            {
+                foreach (OneDriveObject item in lstSharedFiles.ItemsSource)
+                {
+                    item.TextColor = new SolidColorBrush(Colors.White);
+                }
+            }
+
+            //Clear list selections
+            lstSharedFiles.SelectedItem = null;
+            lstMyFiles.SelectedItem = null;
+
+            //Clear "current" variables
+            myCurFile = null;
+            myCurListItem = null;
+            sharedCurFile = null;
+            sharedCurListItem = null;
+            Session.SharedFile = null;
+        }
+    }
+}
